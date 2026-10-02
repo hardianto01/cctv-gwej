@@ -15,7 +15,8 @@ db.run(`
     rtspUrl TEXT NOT NULL,
     enabled INTEGER DEFAULT 1,
     personDetection INTEGER DEFAULT 1,
-    status TEXT DEFAULT 'offline'
+    status TEXT DEFAULT 'offline',
+    telegramTopicId INTEGER DEFAULT NULL
   );
 
   CREATE TABLE IF NOT EXISTS events (
@@ -31,6 +32,10 @@ db.run(`
     value TEXT NOT NULL
   );
 `);
+
+try {
+  db.run('ALTER TABLE cameras ADD COLUMN telegramTopicId INTEGER DEFAULT NULL');
+} catch (e) {}
 
 // Repository: Settings
 export const SettingsRepo = {
@@ -78,8 +83,8 @@ export const CameraRepo = {
   },
   upsert(cam: Camera) {
     db.run(`
-      INSERT INTO cameras (id, name, ip, port, username, password, rtspUrl, enabled, personDetection, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO cameras (id, name, ip, port, username, password, rtspUrl, enabled, personDetection, status, telegramTopicId)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         ip = excluded.ip,
@@ -89,14 +94,19 @@ export const CameraRepo = {
         rtspUrl = excluded.rtspUrl,
         enabled = excluded.enabled,
         personDetection = excluded.personDetection,
-        status = excluded.status
+        status = excluded.status,
+        telegramTopicId = excluded.telegramTopicId
     `, [
       cam.id, cam.name, cam.ip, cam.port, cam.username, cam.password,
-      cam.rtspUrl, cam.enabled ? 1 : 0, cam.personDetection ? 1 : 0, cam.status || 'offline'
+      cam.rtspUrl, cam.enabled ? 1 : 0, cam.personDetection ? 1 : 0, cam.status || 'offline',
+      cam.telegramTopicId || null
     ]);
   },
   updateStatus(id: string, status: 'online' | 'offline') {
     db.run('UPDATE cameras SET status = ? WHERE id = ?', [status, id]);
+  },
+  updateTopicId(id: string, topicId: number) {
+    db.run('UPDATE cameras SET telegramTopicId = ? WHERE id = ?', [topicId, id]);
   },
   delete(id: string) {
     db.run('DELETE FROM cameras WHERE id = ?', [id]);

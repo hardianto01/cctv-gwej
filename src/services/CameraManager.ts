@@ -190,9 +190,11 @@ export class CameraManager {
       session.lastFinishTime = Date.now();
 
       if (duration >= 3 && videoFile && fs.existsSync(videoFile) && fs.statSync(videoFile).size > 20000) {
+        const topicId = await telegramService.ensureTopicForCamera(session.camera.id, session.camera.name);
         await telegramService.sendVideo(
           videoFile,
-          `📹 *Klip Deteksi: ${session.camera.name}*\n⏱ Durasi: \`${duration} detik\`\n🕒 Waktu: \`${timestampStr} WITA\``
+          `📹 *Klip Deteksi: ${session.camera.name}*\n⏱ Durasi: \`${duration} detik\`\n🕒 Waktu: \`${timestampStr} WITA\``,
+        topicId
         );
       }
     });

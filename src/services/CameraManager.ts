@@ -119,9 +119,7 @@ export class CameraManager {
 
   private onPersonDetected(session: ActiveSession) {
     const now = Date.now();
-    if (!session.isRecording && (now - session.lastFinishTime < 4000)) {
-      return;
-    }
+    
 
     if (session.isRecording) {
       if (session.stopTimer) {
@@ -151,11 +149,16 @@ export class CameraManager {
 
     console.log(`[CameraManager] 🚶‍♂️ Person detected on [${session.camera.name}] at ${timestampStr}`);
 
+    // Stream via local go2rtc RTSP proxy (rtsp://127.0.0.1:8554/<camId>)
+    // Keuntungan: go2rtc sudah keep-alive koneksinya di RAM, sehingga FFmpeg langsung
+    // mengunci I-Frame (Keyframe) pertama secara instan (0 ms latency), MENGHILANGKAN TITIK BUTA AWAL!
+    const localStreamUrl = `rtsp://127.0.0.1:8554/${session.camera.id}`;
+
     const args = [
       '-y',
       '-rtsp_transport', 'tcp',
       '-use_wallclock_as_timestamps', '1',
-      '-i', session.camera.rtspUrl,
+      '-i', localStreamUrl,
       '-t', '300',
       '-c:v', 'copy',
       '-c:a', 'aac',

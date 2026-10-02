@@ -1,0 +1,14 @@
+node_modules/
+dist/
+captures/
+cctv.db
+cctv.db-journal
+*.log
+.env
+go2rtc.yaml
+app.js
+dump_topics.js
+ptz_cmd.py
+test_*.js
+test_*.py
+*.py

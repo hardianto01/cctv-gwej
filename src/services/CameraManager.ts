@@ -97,9 +97,12 @@ export class CameraManager {
           const name = data?.$?.Name;
           const val = data?.$?.Value;
 
-          if (name === 'IsPeople' || topic.includes('peopleDetector')) {
-            const isPerson = (val === true || val === 'true');
-            if (isPerson) {
+          const isPersonEvent = name === 'IsPeople' || topic.includes('peopleDetector');
+          const isMotionEvent = name === 'IsMotion' || topic.includes('CellMotionDetector') || topic.includes('TPSmartEvent');
+
+          if (isPersonEvent || isMotionEvent) {
+            const isActive = (val === true || val === 'true');
+            if (isActive) {
               this.onPersonDetected(session);
             } else {
               this.onPersonLeft(session);

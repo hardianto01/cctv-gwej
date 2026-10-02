@@ -73,7 +73,7 @@ export class CameraManager {
 
     this.sessions.set(cam.id, session);
 
-    new Cam({
+    const client = new Cam({
       hostname: cam.ip,
       port: cam.port,
       username: cam.username,
@@ -90,30 +90,6 @@ export class CameraManager {
       this.broadcast('camera:status', { id: cam.id, status: 'online' });
       console.log(`[CameraManager] ✅ ${cam.name} online & listening events.`);
 
-      // Listen events
-      session.camInstance = this;
-      // Attach ONVIF listener
-      session.camInstance = new Cam({
-        hostname: cam.ip,
-        port: cam.port,
-        username: cam.username,
-        password: cam.password
-      }, () => {});
-    });
-
-    // Start direct onvif event loop via Cam class
-    this.attachEventListener(session);
-  }
-
-  private attachEventListener(session: ActiveSession) {
-    const cam = session.camera;
-    const client = new Cam({
-      hostname: cam.ip,
-      port: cam.port,
-      username: cam.username,
-      password: cam.password
-    }, (err) => {
-      if (err) return;
       client.on('event', (msg: any) => {
         try {
           const topic = msg?.topic?._ || msg?.topic || '';
@@ -129,9 +105,12 @@ export class CameraManager {
               this.onPersonLeft(session);
             }
           }
-        } catch (e) {}
+        } catch (e) {
+          console.error('[CameraManager] Event parse error:', e);
+        }
       });
     });
+
     session.camInstance = client;
   }
 

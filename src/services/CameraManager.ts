@@ -154,10 +154,12 @@ export class CameraManager {
     const args = [
       '-y',
       '-rtsp_transport', 'tcp',
+      '-use_wallclock_as_timestamps', '1',
       '-i', session.camera.rtspUrl,
-      '-t', '180',
+      '-t', '300',
       '-c:v', 'copy',
       '-c:a', 'aac',
+      '-movflags', '+faststart',
       session.currentVideoPath
     ];
 

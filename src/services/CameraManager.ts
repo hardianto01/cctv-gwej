@@ -119,7 +119,7 @@ export class CameraManager {
 
   private onPersonDetected(session: ActiveSession) {
     const now = Date.now();
-    if (!session.isRecording && (now - session.lastFinishTime < 10000)) {
+    if (!session.isRecording && (now - session.lastFinishTime < 4000)) {
       return;
     }
 
@@ -188,7 +188,8 @@ export class CameraManager {
   }
 
   private onPersonLeft(session: ActiveSession) {
-    if (!session.isRecording || session.isStopping) return;
+    if (!session.isRecording) return;
+    if (session.stopTimer) clearTimeout(session.stopTimer);
 
     session.isStopping = true;
     session.stopTimer = setTimeout(() => {
@@ -196,7 +197,7 @@ export class CameraManager {
         console.log(`[CameraManager] 🛑 Finalizing video for [${session.camera.name}]...`);
         session.recordProc.kill('SIGINT');
       }
-    }, 8000); // 8 detik buffer
+    }, 15000); // 15 detik buffer tenang
   }
 
   stopCamera(id: string) {

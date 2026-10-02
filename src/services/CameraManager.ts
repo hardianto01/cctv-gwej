@@ -23,6 +23,7 @@ interface ActiveSession {
   recordingStartTime: number;
   stopTimer: any;
   lastFinishTime: number;
+  lastMotionTime: number;
 }
 
 export class CameraManager {
@@ -68,7 +69,8 @@ export class CameraManager {
       currentVideoPath: null,
       recordingStartTime: 0,
       stopTimer: null,
-      lastFinishTime: 0
+      lastFinishTime: 0,
+      lastMotionTime: 0
     };
 
     this.sessions.set(cam.id, session);
@@ -103,8 +105,12 @@ export class CameraManager {
           if (isPersonEvent || isMotionEvent) {
             const isActive = (val === true || val === 'true');
             if (isActive) {
+              // Update heartbeat waktu gerakan aktif terbaru!
+              session.lastMotionTime = Date.now();
               this.onPersonDetected(session);
             } else {
+              // Kamera kirim False: JANGAN LANGSUNG POTONG!
+              // Cek dulu apakah 25 detik terakhir ada gerakan.
               this.onPersonLeft(session);
             }
           }

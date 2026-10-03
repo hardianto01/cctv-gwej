@@ -5,7 +5,8 @@
     ArrowUp, ArrowDown, ArrowLeft, ArrowRight,
     Bell, LogOut, CheckCircle2, Moon, Sun, 
     Maximize2, Minimize2, Grid, SlidersHorizontal, 
-    X, Info, Radio, Activity, Languages
+    X, Info, Radio, Activity, Languages,
+    Terminal, Copy, Trash, Check
   } from 'lucide-svelte';
   import { translations, type Lang } from './lib/i18n';
 
@@ -63,7 +64,73 @@
   // Hub & Full-page focus states
   let focusedCam = $state<Camera | null>(null);
   let isDrawerOpen = $state(false);
+  let drawerTab = $state<'events' | 'console'>('events');
+  let consoleFilter = $state<string>('ALL');
+  let copiedNotice = $state(false);
   let gridColumnsMode = $state<'auto' | '1' | '2' | '3'>('auto');
+
+  // Interactive Audit Console Logs
+  export interface UiLogEntry {
+    id: string;
+    time: string;
+    tag: 'AUTH' | 'WEBSOCKET' | 'WEBRTC' | 'PTZ' | 'CAMERA' | 'SETTINGS';
+    level: 'info' | 'warn' | 'error' | 'success';
+    message: string;
+    data?: any;
+    expanded?: boolean;
+  }
+
+  let consoleLogs = $state<UiLogEntry[]>([]);
+  let filteredLogs = $derived(consoleFilter === 'ALL' ? consoleLogs : consoleLogs.filter(l => l.tag === consoleFilter));
+
+  function uiLog(tag: UiLogEntry['tag'], message: string, data?: any, level: UiLogEntry['level'] = 'info') {
+    const now = new Date();
+    const time = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}.${now.getMilliseconds().toString().padStart(3, '0')}`;
+    const entry: UiLogEntry = {
+      id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      time,
+      tag,
+      level,
+      message,
+      data,
+      expanded: false
+    };
+
+    consoleLogs = [entry, ...consoleLogs.slice(0, 199)];
+
+    // Styled DevTools Console Output for F12 Audit
+    const tagStyles: Record<string, string> = {
+      AUTH: 'background: #2563eb; color: #ffffff; padding: 2px 6px; border-radius: 3px; font-weight: bold;',
+      WEBSOCKET: 'background: #7c3aed; color: #ffffff; padding: 2px 6px; border-radius: 3px; font-weight: bold;',
+      WEBRTC: 'background: #059669; color: #ffffff; padding: 2px 6px; border-radius: 3px; font-weight: bold;',
+      PTZ: 'background: #d97706; color: #ffffff; padding: 2px 6px; border-radius: 3px; font-weight: bold;',
+      CAMERA: 'background: #0891b2; color: #ffffff; padding: 2px 6px; border-radius: 3px; font-weight: bold;',
+      SETTINGS: 'background: #db2777; color: #ffffff; padding: 2px 6px; border-radius: 3px; font-weight: bold;'
+    };
+    const timeStyle = 'color: #94a3b8; font-family: monospace; font-size: 11px;';
+    const tagStyle = tagStyles[tag] || 'background: #475569; color: #fff; padding: 2px 6px; border-radius: 3px;';
+
+    if (level === 'error') {
+      console.error(`%c${time}%c %c${tag}%c ${message}`, timeStyle, '', tagStyle, 'color: #ef4444; font-weight: bold;', data !== undefined ? data : '');
+    } else if (level === 'warn') {
+      console.warn(`%c${time}%c %c${tag}%c ${message}`, timeStyle, '', tagStyle, 'color: #f59e0b; font-weight: bold;', data !== undefined ? data : '');
+    } else if (level === 'success') {
+      console.log(`%c${time}%c %c${tag}%c ${message}`, timeStyle, '', tagStyle, 'color: #10b981; font-weight: bold;', data !== undefined ? data : '');
+    } else {
+      console.log(`%c${time}%c %c${tag}%c ${message}`, timeStyle, '', tagStyle, 'color: inherit;', data !== undefined ? data : '');
+    }
+  }
+
+  function copyConsoleLogs() {
+    const text = consoleLogs
+      .map(l => `[${l.time}] [${l.tag}] [${l.level.toUpperCase()}] ${l.message}${l.data ? ' -> ' + JSON.stringify(l.data) : ''}`)
+      .reverse()
+      .join('\n');
+    navigator.clipboard.writeText(text).then(() => {
+      copiedNotice = true;
+      setTimeout(() => copiedNotice = false, 2000);
+    });
+  }
 
   // Settings
   let tgBotToken = $state('');
@@ -92,16 +159,25 @@
   }
 
   async function checkAuth() {
-    if (!token) { isAuthenticated = false; return; }
+    if (!token) { 
+      isAuthenticated = false; 
+      uiLog('AUTH', 'Tidak ada token JWT tersimpan, perlu login', undefined, 'warn');
+      return; 
+    }
+    uiLog('AUTH', 'Memverifikasi status sesi pengguna dengan token...');
     try {
       const res = await fetch('/api/auth/me', { headers: authHeaders() });
       if (res.ok) {
+        const data = await res.json();
         isAuthenticated = true;
+        uiLog('AUTH', `Sesi valid! Login sebagai "${data.user}"`, data, 'success');
         await loadInitialData();
       } else {
+        uiLog('AUTH', 'Token kedaluwarsa atau tidak valid, diarahkan ke login', undefined, 'warn');
         doLogout();
       }
-    } catch {
+    } catch (e: any) {
+      uiLog('AUTH', `Gagal koneksi saat verifikasi token: ${e.message}`, undefined, 'error');
       doLogout();
     }
   }
@@ -109,6 +185,7 @@
   async function doLogin(e: Event) {
     e.preventDefault();
     loginError = '';
+    uiLog('AUTH', `Mencoba login username: "${loginUser}"...`);
     try {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
@@ -120,16 +197,20 @@
         token = data.token;
         localStorage.setItem('sentinel_jwt', token);
         isAuthenticated = true;
+        uiLog('AUTH', `Login sukses! Token JWT berhasil disimpan.`, data, 'success');
         await loadInitialData();
       } else {
         loginError = data.error || t.loginFailed;
+        uiLog('AUTH', `Login ditolak: ${loginError}`, data, 'error');
       }
     } catch (err: any) {
       loginError = err.message;
+      uiLog('AUTH', `Login error jaringan: ${err.message}`, undefined, 'error');
     }
   }
 
   function doLogout() {
+    uiLog('AUTH', 'Pengguna logout. Sesi lokal dibersihkan & koneksi WebRTC ditutup.', undefined, 'warn');
     token = '';
     localStorage.removeItem('sentinel_jwt');
     isAuthenticated = false;
@@ -138,6 +219,7 @@
   }
 
   async function loadInitialData() {
+    uiLog('CAMERA', 'Mengambil data awal (kamera, riwayat event, dan pengaturan)...');
     await Promise.all([loadCameras(), loadEvents(), loadSettings()]);
   }
 
@@ -146,19 +228,25 @@
       const res = await fetch('/api/cameras', { headers: authHeaders() });
       if (res.ok) {
         cameras = await res.json();
+        uiLog('CAMERA', `Daftar kamera berhasil dimuat: ${cameras.length} unit`, cameras.map(c => ({ id: c.id, name: c.name, status: c.status, topicId: c.telegramTopicId })), 'success');
         setTimeout(initWebRTCAll, 100);
+      } else {
+        uiLog('CAMERA', `Gagal memuat kamera, status HTTP: ${res.status}`, undefined, 'error');
       }
-    } catch (e) {
-      console.error(e);
+    } catch (e: any) {
+      uiLog('CAMERA', `Error request loadCameras: ${e.message}`, undefined, 'error');
     }
   }
 
   async function loadEvents() {
     try {
       const res = await fetch('/api/events', { headers: authHeaders() });
-      if (res.ok) events = await res.json();
-    } catch (e) {
-      console.error(e);
+      if (res.ok) {
+        events = await res.json();
+        uiLog('CAMERA', `Riwayat event dimuat: ${events.length} event tersimpan`, undefined, 'info');
+      }
+    } catch (e: any) {
+      uiLog('CAMERA', `Error request loadEvents: ${e.message}`, undefined, 'error');
     }
   }
 
@@ -170,15 +258,17 @@
         tgBotToken = data.telegram_bot_token || '';
         tgChatId = data.telegram_chat_id || '';
         adminUsername = data.admin_username || '';
+        uiLog('SETTINGS', 'Pengaturan sistem berhasil dimuat', { adminUsername, targetChat: tgChatId }, 'info');
       }
-    } catch (e) {
-      console.error(e);
+    } catch (e: any) {
+      uiLog('SETTINGS', `Error request loadSettings: ${e.message}`, undefined, 'error');
     }
   }
 
   async function saveSettings(e: Event) {
     e.preventDefault();
     settingsNotice = '';
+    uiLog('SETTINGS', 'Menyimpan konfigurasi sistem ke server...');
     const res = await fetch('/api/settings', {
       method: 'POST',
       headers: authHeaders(),
@@ -192,11 +282,15 @@
     if (res.ok) {
       settingsNotice = t.settingsSaved;
       newPassword = '';
+      uiLog('SETTINGS', 'Konfigurasi berhasil disimpan!', undefined, 'success');
+    } else {
+      uiLog('SETTINGS', `Gagal menyimpan konfigurasi HTTP ${res.status}`, undefined, 'error');
     }
   }
 
   async function testTelegram() {
     settingsNotice = t.tgTesting;
+    uiLog('SETTINGS', 'Menguji koneksi Telegram (getMe & sendMessage)...');
     const res = await fetch('/api/settings/test-telegram', {
       method: 'POST',
       headers: authHeaders(),
@@ -204,6 +298,7 @@
     });
     const data = await res.json();
     settingsNotice = data.success ? t.tgTestSuccess : `${t.tgTestFailed}: ${data.message}`;
+    uiLog('SETTINGS', `Hasil test Telegram: ${data.message}`, data, data.success ? 'success' : 'error');
   }
 
   async function initWebRTCAll() {
@@ -213,9 +308,13 @@
   }
 
   async function startWebRTC(cam: Camera) {
-    if (pcs.has(cam.id)) pcs.get(cam.id)?.close();
+    if (pcs.has(cam.id)) {
+      uiLog('WEBRTC', `[${cam.name}] Me-refresh PeerConnection yang sudah ada...`, undefined, 'info');
+      pcs.get(cam.id)?.close();
+    }
 
     try {
+      uiLog('WEBRTC', `[${cam.name}] Menginisialisasi RTCPeerConnection (STUN google)...`);
       const pc = new RTCPeerConnection({
         iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
       });
@@ -225,7 +324,10 @@
       pc.addTransceiver('audio', { direction: 'recvonly' });
 
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        const state = pc.connectionState;
+        uiLog('WEBRTC', `[${cam.name}] Connection state: "${state}"`, undefined, state === 'connected' ? 'success' : state === 'failed' || state === 'disconnected' ? 'warn' : 'info');
+        if (state === 'failed' || state === 'disconnected') {
+          uiLog('WEBRTC', `[${cam.name}] Stream terputus, auto-reconnect dalam 3 detik...`, undefined, 'warn');
           setTimeout(() => {
             if (cam.enabled && pcs.get(cam.id) === pc) {
               startWebRTC(cam);
@@ -235,6 +337,7 @@
       };
 
       pc.ontrack = (event) => {
+        uiLog('WEBRTC', `[${cam.name}] Media track diterima: ${event.track.kind} (${event.track.id})`, undefined, 'success');
         const stream = event.streams[0];
         const videoEl = document.getElementById(`video-${cam.id}`) as HTMLVideoElement;
         if (videoEl && videoEl.srcObject !== stream) {
@@ -248,9 +351,11 @@
         }
       };
 
+      uiLog('WEBRTC', `[${cam.name}] Membuat WebRTC SDP Offer...`);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
+      uiLog('WEBRTC', `[${cam.name}] Mengirim SDP Offer ke gateway WHEP (/api/whep/${cam.id})...`);
       const res = await fetch(`/api/whep/${cam.id}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/sdp' },
@@ -260,33 +365,50 @@
       if (res.ok) {
         const answer = await res.text();
         await pc.setRemoteDescription({ type: 'answer', sdp: answer });
+        uiLog('WEBRTC', `[${cam.name}] Handshake WHEP selesai, SDP Answer diset. Live playback aktif!`, undefined, 'success');
+      } else {
+        uiLog('WEBRTC', `[${cam.name}] Gateway WHEP merespon error: HTTP ${res.status}`, undefined, 'error');
       }
-    } catch (err) {
-      console.error(err);
+    } catch (err: any) {
+      uiLog('WEBRTC', `[${cam.name}] WebRTC exception: ${err.message}`, undefined, 'error');
     }
   }
 
   async function stepPTZ(camId: string, direction: 'up' | 'down' | 'left' | 'right') {
-    await fetch(`/api/cameras/${camId}/ptz`, {
-      method: 'POST',
-      headers: authHeaders(),
-      body: JSON.stringify({ direction })
-    });
+    uiLog('PTZ', `Kamera [${camId}] mengirim perintah gerak: ${direction.toUpperCase()}`);
+    try {
+      const res = await fetch(`/api/cameras/${camId}/ptz`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ direction })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        uiLog('PTZ', `Perintah PTZ [${camId}] berhasil dieksekusi ONVIF`, data, 'success');
+      } else {
+        uiLog('PTZ', `Perintah PTZ [${camId}] gagal: ${data.error || 'Unknown error'}`, data, 'error');
+      }
+    } catch (e: any) {
+      uiLog('PTZ', `Error jaringan perintah PTZ: ${e.message}`, undefined, 'error');
+    }
   }
 
   async function toggleCamera(id: string) {
+    uiLog('CAMERA', `Mengubah status toggle aktif/nonaktif kamera: [${id}]`);
     await fetch(`/api/cameras/${id}/toggle`, { method: 'PATCH', headers: authHeaders() });
     await loadCameras();
   }
 
   async function deleteCamera(id: string) {
     if (!confirm(t.deleteConfirm)) return;
+    uiLog('CAMERA', `Menghapus kamera: [${id}]`, undefined, 'warn');
     await fetch(`/api/cameras/${id}`, { method: 'DELETE', headers: authHeaders() });
     await loadCameras();
   }
 
   async function handleAddCamera(e: Event) {
     e.preventDefault();
+    uiLog('CAMERA', `Menambahkan kamera baru: "${formName}" (${formIp})`);
     await fetch('/api/cameras', {
       method: 'POST',
       headers: authHeaders(),
@@ -303,6 +425,7 @@
       })
     });
     showAddModal = false;
+    uiLog('CAMERA', `Kamera "${formName}" berhasil disimpan!`, undefined, 'success');
     await loadCameras();
   }
 
@@ -346,20 +469,42 @@
     function connectWs() {
       if (isDisposed) return;
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(`${proto}//${location.host}/ws`);
+      const wsUrl = `${proto}//${location.host}/ws`;
+      uiLog('WEBSOCKET', `Membuka koneksi WebSocket ke ${wsUrl}...`);
+      ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        uiLog('WEBSOCKET', 'WebSocket terhubung ke server (live event feed aktif)', undefined, 'success');
+      };
+
       ws.onmessage = (msg) => {
         try {
           const data = JSON.parse(msg.data);
-          if (data.event === 'event:new') events = [data.payload, ...events.slice(0, 49)];
-          else if (data.event === 'camera:status') loadCameras();
-        } catch (e) {}
+          if (data.event === 'connected') {
+            uiLog('WEBSOCKET', `Handshake server dikonfirmasi pada ${data.time}`, data, 'success');
+          } else if (data.event === 'event:new') {
+            uiLog('WEBSOCKET', `[DETEKSI] ${data.payload.cameraName}: gerakan terdeteksi (${data.payload.type})`, data.payload, 'warn');
+            events = [data.payload, ...events.slice(0, 49)];
+          } else if (data.event === 'camera:status') {
+            uiLog('WEBSOCKET', `Status kamera [${data.payload.id}] diperbarui: ${data.payload.status}`, data.payload, 'info');
+            loadCameras();
+          } else {
+            uiLog('WEBSOCKET', `Pesan WebSocket diterima: ${data.event}`, data, 'info');
+          }
+        } catch (e: any) {
+          uiLog('WEBSOCKET', `Gagal parse pesan WebSocket: ${e.message}`, undefined, 'error');
+        }
       };
+
       ws.onclose = () => {
+        uiLog('WEBSOCKET', 'Koneksi WebSocket terputus. Menjadwalkan reconnect dalam 3 detik...', undefined, 'warn');
         if (!isDisposed) {
           wsReconnectTimer = setTimeout(connectWs, 3000);
         }
       };
+
       ws.onerror = () => {
+        uiLog('WEBSOCKET', 'WebSocket mengalami network error', undefined, 'error');
         try { ws?.close(); } catch (e) {}
       };
     }
@@ -713,54 +858,177 @@
         class="fixed inset-0 bg-black/60 backdrop-blur-xs z-40 transition-opacity"
       ></div>
 
-      <aside class="fixed right-0 top-0 bottom-0 w-80 md:w-96 bg-white dark:bg-zinc-950 border-l border-zinc-200 dark:border-zinc-800 z-50 shadow-2xl flex flex-col animate-in slide-in-from-right duration-200">
+      <aside class="fixed right-0 top-0 bottom-0 w-88 md:w-112 lg:w-[460px] bg-white dark:bg-zinc-950 border-l border-zinc-200 dark:border-zinc-800 z-50 shadow-2xl flex flex-col animate-in slide-in-from-right duration-200">
         <div class="h-12 border-b border-zinc-200 dark:border-zinc-800 px-4 flex items-center justify-between">
           <div class="flex items-center gap-2">
-            <Bell class="h-4 w-4 text-zinc-500" />
+            {#if drawerTab === 'events'}
+              <Bell class="h-4 w-4 text-zinc-500" />
+            {:else}
+              <Terminal class="h-4 w-4 text-emerald-500" />
+            {/if}
             <span class="text-xs font-bold uppercase tracking-wider font-mono">{t.drawerTitle}</span>
           </div>
-          <button onclick={() => isDrawerOpen = false} class="p-1 rounded text-zinc-400 hover:text-zinc-900 dark:hover:text-white">
+          <button onclick={() => isDrawerOpen = false} class="p-1 rounded text-zinc-400 hover:text-zinc-900 dark:hover:text-white transition">
             <X class="h-4 w-4" />
           </button>
         </div>
 
-        <!-- Camera Status Summary -->
-        <div class="p-4 border-b border-zinc-200 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/30">
-          <span class="text-[10px] font-mono uppercase text-zinc-500 block mb-2">{t.connectedCamSummary}</span>
-          <div class="space-y-1.5">
-            {#each cameras as c}
-              <div class="flex items-center justify-between text-xs">
-                <span class="text-zinc-700 dark:text-zinc-300 font-medium truncate">{c.name}</span>
-                <span class="text-[10px] font-mono px-1.5 py-0.5 rounded {c.status === 'online' ? 'bg-emerald-500/10 text-emerald-500' : 'bg-red-500/10 text-red-500'}">
-                  {c.status}
-                </span>
-              </div>
-            {/each}
-          </div>
+        <!-- Navigation Tabs: Events vs Audit Console -->
+        <div class="flex border-b border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900/60 p-1.5 gap-1.5">
+          <button
+            onclick={() => drawerTab = 'events'}
+            class="flex-1 py-1.5 px-3 rounded text-xs font-mono font-medium flex items-center justify-center gap-1.5 transition-colors {drawerTab === 'events' ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 shadow-xs' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}"
+          >
+            <Bell class="h-3.5 w-3.5" />
+            <span>{t.tabEvents}</span>
+            <span class="text-[10px] px-1 rounded bg-zinc-200 dark:bg-zinc-700/60">{events.length}</span>
+          </button>
+          <button
+            onclick={() => drawerTab = 'console'}
+            class="flex-1 py-1.5 px-3 rounded text-xs font-mono font-medium flex items-center justify-center gap-1.5 transition-colors {drawerTab === 'console' ? 'bg-white dark:bg-zinc-800 text-emerald-500 dark:text-emerald-400 shadow-xs' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-300'}"
+          >
+            <Terminal class="h-3.5 w-3.5" />
+            <span>{t.tabConsole}</span>
+            <span class="text-[10px] px-1 rounded bg-emerald-500/10 text-emerald-500 font-bold">{consoleLogs.length}</span>
+          </button>
         </div>
 
-        <!-- Realtime Detection Feed -->
-        <div class="flex-1 overflow-y-auto p-4 space-y-2">
-          <span class="text-[10px] font-mono uppercase text-zinc-500 block mb-2">{t.recentEvents}</span>
-          {#if events.length === 0}
-            <div class="text-center py-12 text-zinc-500 text-xs font-mono">
-              {t.noEvents}
-            </div>
-          {:else}
-            {#each events as evt (evt.id)}
-              <div class="rounded border border-zinc-200 dark:border-zinc-800/80 bg-zinc-50 dark:bg-zinc-900/50 p-2.5 text-xs">
-                <div class="flex items-center justify-between mb-1">
-                  <span class="font-medium text-zinc-900 dark:text-zinc-200 text-xs truncate">{evt.cameraName}</span>
-                  <span class="text-[10px] text-zinc-500 font-mono">{new Date(evt.timestamp).toLocaleTimeString()}</span>
+        {#if drawerTab === 'events'}
+          <!-- Camera Status Summary -->
+          <div class="p-4 border-b border-zinc-200 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/30">
+            <span class="text-[10px] font-mono uppercase text-zinc-500 block mb-2">{t.connectedCamSummary}</span>
+            <div class="space-y-1.5">
+              {#each cameras as c}
+                <div class="flex items-center justify-between text-xs">
+                  <span class="text-zinc-700 dark:text-zinc-300 font-medium truncate">{c.name}</span>
+                  <span class="text-[10px] font-mono px-1.5 py-0.5 rounded {c.status === 'online' ? 'bg-emerald-500/10 text-emerald-500' : 'bg-red-500/10 text-red-500'}">
+                    {c.status}
+                  </span>
                 </div>
-                <p class="text-[11px] text-zinc-500 font-mono flex items-center gap-1.5">
-                  <span class="h-1.5 w-1.5 rounded-full bg-emerald-500"></span>
-                  <span>{t.personDetectedTg}</span>
-                </p>
+              {/each}
+            </div>
+          </div>
+
+          <!-- Realtime Detection Feed -->
+          <div class="flex-1 overflow-y-auto p-4 space-y-2">
+            <span class="text-[10px] font-mono uppercase text-zinc-500 block mb-2">{t.recentEvents}</span>
+            {#if events.length === 0}
+              <div class="text-center py-12 text-zinc-500 text-xs font-mono">
+                {t.noEvents}
               </div>
-            {/each}
-          {/if}
-        </div>
+            {:else}
+              {#each events as evt (evt.id)}
+                <div class="rounded border border-zinc-200 dark:border-zinc-800/80 bg-zinc-50 dark:bg-zinc-900/50 p-2.5 text-xs">
+                  <div class="flex items-center justify-between mb-1">
+                    <span class="font-medium text-zinc-900 dark:text-zinc-200 text-xs truncate">{evt.cameraName}</span>
+                    <span class="text-[10px] text-zinc-500 font-mono">{new Date(evt.timestamp).toLocaleTimeString()}</span>
+                  </div>
+                  <p class="text-[11px] text-zinc-500 font-mono flex items-center gap-1.5">
+                    <span class="h-1.5 w-1.5 rounded-full bg-emerald-500"></span>
+                    <span>{t.personDetectedTg}</span>
+                  </p>
+                </div>
+              {/each}
+            {/if}
+          </div>
+        {:else}
+          <!-- Interactive Audit Console Logs View -->
+          <div class="p-3 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/40 space-y-2">
+            <!-- Filter Pills -->
+            <div class="flex items-center justify-between gap-1 overflow-x-auto pb-1 text-[10px] font-mono">
+              <div class="flex items-center gap-1">
+                {#each ['ALL', 'WEBRTC', 'WEBSOCKET', 'CAMERA', 'PTZ', 'AUTH', 'SETTINGS'] as f}
+                  <button
+                    onclick={() => consoleFilter = f}
+                    class="px-2 py-0.5 rounded transition-colors {consoleFilter === f ? 'bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 font-bold' : 'bg-zinc-200/70 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-300 dark:hover:bg-zinc-700'}"
+                  >
+                    {f}
+                  </button>
+                {/each}
+              </div>
+            </div>
+
+            <!-- Toolbar buttons -->
+            <div class="flex items-center justify-between pt-1 text-[11px] font-mono">
+              <span class="text-zinc-500 text-[10px]">
+                {filteredLogs.length} logs
+              </span>
+              <div class="flex items-center gap-1.5">
+                <button
+                  onclick={copyConsoleLogs}
+                  class="px-2 py-1 rounded border border-zinc-300 dark:border-zinc-800 bg-white dark:bg-zinc-900 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-300 flex items-center gap-1 transition"
+                  title="Copy logs to clipboard"
+                >
+                  {#if copiedNotice}
+                    <Check class="h-3 w-3 text-emerald-500" />
+                    <span class="text-emerald-500 font-semibold">{t.copied}</span>
+                  {:else}
+                    <Copy class="h-3 w-3" />
+                    <span>{t.copyLogs}</span>
+                  {/if}
+                </button>
+                <button
+                  onclick={() => consoleLogs = []}
+                  class="px-2 py-1 rounded border border-zinc-300 dark:border-zinc-800 bg-white dark:bg-zinc-900 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-300 flex items-center gap-1 transition"
+                  title="Clear all logs"
+                >
+                  <Trash class="h-3 w-3" />
+                  <span>{t.clearLogs}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Log stream output -->
+          <div class="flex-1 overflow-y-auto p-2.5 font-mono text-[11px] space-y-1.5 bg-zinc-950 text-zinc-200">
+            {#if filteredLogs.length === 0}
+              <div class="text-center py-16 text-zinc-600 text-xs">
+                No logs recorded for filter "{consoleFilter}"
+              </div>
+            {:else}
+              {#each filteredLogs as log (log.id)}
+                <div class="p-2 rounded bg-zinc-900/80 border border-zinc-800/80 hover:border-zinc-700 transition">
+                  <div class="flex items-start justify-between gap-1.5">
+                    <div class="flex items-center gap-1.5 flex-wrap">
+                      <span class="text-zinc-500 text-[10px]">{log.time}</span>
+                      <span class="px-1.5 py-0.2 rounded text-[9px] font-bold tracking-wider 
+                        {log.tag === 'AUTH' ? 'bg-blue-500/20 text-blue-400' :
+                         log.tag === 'WEBSOCKET' ? 'bg-purple-500/20 text-purple-400' :
+                         log.tag === 'WEBRTC' ? 'bg-emerald-500/20 text-emerald-400' :
+                         log.tag === 'PTZ' ? 'bg-amber-500/20 text-amber-400' :
+                         log.tag === 'SETTINGS' ? 'bg-pink-500/20 text-pink-400' :
+                         'bg-cyan-500/20 text-cyan-400'}">
+                        {log.tag}
+                      </span>
+                      <span class="h-1.5 w-1.5 rounded-full 
+                        {log.level === 'error' ? 'bg-red-500 animate-pulse' :
+                         log.level === 'warn' ? 'bg-amber-400' :
+                         log.level === 'success' ? 'bg-emerald-400' :
+                         'bg-zinc-500'}"></span>
+                    </div>
+                  </div>
+                  <p class="mt-1 text-zinc-300 leading-snug break-words">{log.message}</p>
+                  {#if log.data !== undefined}
+                    <details class="mt-1.5">
+                      <summary class="cursor-pointer text-[10px] text-zinc-500 hover:text-zinc-400 select-none">
+                        payload
+                      </summary>
+                      <pre class="mt-1 p-1.5 rounded bg-black/60 text-[10px] text-zinc-400 overflow-x-auto max-h-36">{JSON.stringify(log.data, null, 2)}</pre>
+                    </details>
+                  {/if}
+                </div>
+              {/each}
+            {/if}
+          </div>
+
+          <div class="p-2 border-t border-zinc-800 bg-zinc-950 text-[10px] font-mono text-zinc-500 flex items-center justify-between">
+            <span class="flex items-center gap-1">
+              <span class="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+              Live DevTools mirror active (F12)
+            </span>
+            <span class="text-zinc-600">Auto-buffered</span>
+          </div>
+        {/if}
       </aside>
     {/if}
 

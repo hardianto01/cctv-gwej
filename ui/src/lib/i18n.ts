@@ -57,7 +57,12 @@ export const translations = {
     modalCamRtsp: 'RTSP URL',
     cancel: 'Batal',
     save: 'Simpan',
-    deleteConfirm: 'Hapus kamera ini secara permanen?'
+    deleteConfirm: 'Hapus kamera ini secara permanen?',
+    tabEvents: 'Deteksi Event',
+    tabConsole: 'Audit Log Console',
+    clearLogs: 'Bersihkan Log',
+    copyLogs: 'Salin Log',
+    copied: 'Disalin!'
   },
   en: {
     brand: 'MONITORING HOME',
@@ -115,6 +120,11 @@ export const translations = {
     modalCamRtsp: 'RTSP URL',
     cancel: 'Cancel',
     save: 'Save',
-    deleteConfirm: 'Permanently remove this camera?'
+    deleteConfirm: 'Permanently remove this camera?',
+    tabEvents: 'Detection Events',
+    tabConsole: 'Audit Console Logs',
+    clearLogs: 'Clear Logs',
+    copyLogs: 'Copy Logs',
+    copied: 'Copied!'
   }
 };

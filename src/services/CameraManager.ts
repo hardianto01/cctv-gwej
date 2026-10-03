@@ -82,6 +82,11 @@ export class CameraManager {
 
   private connectOnvif(session: ActiveSession) {
     const cam = session.camera;
+    if (session.reconnectTimer) {
+      clearTimeout(session.reconnectTimer);
+      session.reconnectTimer = null;
+    }
+
     try {
       if (session.camInstance) {
         session.camInstance.removeAllListeners?.();
@@ -98,7 +103,6 @@ export class CameraManager {
         console.error(`[CameraManager] ${cam.name} (${cam.ip}) ONVIF connection error:`, err.message);
         CameraRepo.updateStatus(cam.id, 'offline');
         this.broadcast('camera:status', { id: cam.id, status: 'offline' });
-        // Retry connection in 10s if initial connect failed
         session.reconnectTimer = setTimeout(() => this.connectOnvif(session), 10000);
         return;
       }
@@ -107,7 +111,7 @@ export class CameraManager {
       this.broadcast('camera:status', { id: cam.id, status: 'online' });
       console.log(`[CameraManager] ✅ ${cam.name} online & listening events.`);
 
-      client.on('event', (msg: any) => {
+      const handleEventMessage = (msg: any) => {
         session.lastEventTime = Date.now();
         try {
           const topic = msg?.topic?._ || msg?.topic || '';
@@ -130,18 +134,36 @@ export class CameraManager {
         } catch (e) {
           console.error('[CameraManager] Event parse error:', e);
         }
-      });
+      };
 
-      // Watchdog: jika event listener putus atau error dari kamera, auto-reconnect
+      // Kustomisasi event loop yang stabil & anti-macet:
+      // Hindari loop bawaan node-onvif yang melakukan ratusan renew() per menit
+      client.removeAllListeners('event');
+      client.on('event', handleEventMessage);
+
+      // Heartbeat Watchdog per session:
+      // Jika dalam 90 detik sama sekali tidak ada event atau poll stuck, re-init koneksi secara hening
+      const scheduleWatchdog = () => {
+        if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
+        session.reconnectTimer = setInterval(() => {
+          const silenceDuration = Date.now() - session.lastEventTime;
+          // Cek apakah langganan event masih hidup dengan memanggil getEventProperties/pull
+          if (silenceDuration > 60000) {
+            client.getEventProperties((err: any) => {
+              if (err) {
+                console.warn(`[CameraManager] ⚠️ Event bus silent & ping failed for ${cam.name}. Reconnecting...`);
+                this.connectOnvif(session);
+              }
+            });
+          }
+        }, 30000);
+      };
+
+      scheduleWatchdog();
+
       client.on('eventsError', (error: any) => {
         console.warn(`[CameraManager] ⚠️ ${cam.name} ONVIF eventsError:`, error?.message || error);
-        if (!session.reconnectTimer) {
-          session.reconnectTimer = setTimeout(() => {
-            session.reconnectTimer = null;
-            console.log(`[CameraManager] 🔄 Reconnecting ONVIF events for ${cam.name}...`);
-            this.connectOnvif(session);
-          }, 5000);
-        }
+        setTimeout(() => this.connectOnvif(session), 4000);
       });
     });
 

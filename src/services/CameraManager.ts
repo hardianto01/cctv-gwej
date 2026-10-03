@@ -24,6 +24,8 @@ interface ActiveSession {
   stopTimer: any;
   lastFinishTime: number;
   lastMotionTime: number;
+  reconnectTimer?: any;
+  lastEventTime: number;
 }
 
 export class CameraManager {
@@ -70,10 +72,21 @@ export class CameraManager {
       recordingStartTime: 0,
       stopTimer: null,
       lastFinishTime: 0,
-      lastMotionTime: 0
+      lastMotionTime: 0,
+      lastEventTime: Date.now()
     };
 
     this.sessions.set(cam.id, session);
+    this.connectOnvif(session);
+  }
+
+  private connectOnvif(session: ActiveSession) {
+    const cam = session.camera;
+    try {
+      if (session.camInstance) {
+        session.camInstance.removeAllListeners?.();
+      }
+    } catch (e) {}
 
     const client = new Cam({
       hostname: cam.ip,
@@ -85,6 +98,8 @@ export class CameraManager {
         console.error(`[CameraManager] ${cam.name} (${cam.ip}) ONVIF connection error:`, err.message);
         CameraRepo.updateStatus(cam.id, 'offline');
         this.broadcast('camera:status', { id: cam.id, status: 'offline' });
+        // Retry connection in 10s if initial connect failed
+        session.reconnectTimer = setTimeout(() => this.connectOnvif(session), 10000);
         return;
       }
 
@@ -93,6 +108,7 @@ export class CameraManager {
       console.log(`[CameraManager] ✅ ${cam.name} online & listening events.`);
 
       client.on('event', (msg: any) => {
+        session.lastEventTime = Date.now();
         try {
           const topic = msg?.topic?._ || msg?.topic || '';
           const data = msg?.message?.message?.data?.simpleItem;
@@ -105,17 +121,26 @@ export class CameraManager {
           if (isPersonEvent || isMotionEvent) {
             const isActive = (val === true || val === 'true');
             if (isActive) {
-              // Update heartbeat waktu gerakan aktif terbaru!
               session.lastMotionTime = Date.now();
               this.onPersonDetected(session);
             } else {
-              // Kamera kirim False: JANGAN LANGSUNG POTONG!
-              // Cek dulu apakah 25 detik terakhir ada gerakan.
               this.onPersonLeft(session);
             }
           }
         } catch (e) {
           console.error('[CameraManager] Event parse error:', e);
+        }
+      });
+
+      // Watchdog: jika event listener putus atau error dari kamera, auto-reconnect
+      client.on('eventsError', (error: any) => {
+        console.warn(`[CameraManager] ⚠️ ${cam.name} ONVIF eventsError:`, error?.message || error);
+        if (!session.reconnectTimer) {
+          session.reconnectTimer = setTimeout(() => {
+            session.reconnectTimer = null;
+            console.log(`[CameraManager] 🔄 Reconnecting ONVIF events for ${cam.name}...`);
+            this.connectOnvif(session);
+          }, 5000);
         }
       });
     });
@@ -219,6 +244,8 @@ export class CameraManager {
       if (session.recordProc) {
         try { session.recordProc.kill('SIGKILL'); } catch (e) {}
       }
+      if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
+      try { session.camInstance?.removeAllListeners?.(); } catch (e) {}
       this.sessions.delete(id);
     }
   }

@@ -25,9 +25,10 @@ interface ActiveSession {
   stopTimer: any;
   lastFinishTime: number;
   lastMotionTime: number;
-  watchdogTimer?: any;
+  lastPullActivity: number;
   reconnectTimer?: any;
-  lastEventTime: number;
+  watchdogTimer?: any;
+  pullLoopStop?: () => void;
 }
 
 export class CameraManager {
@@ -36,7 +37,7 @@ export class CameraManager {
 
   constructor() {
     this.cleanOldCaptures();
-    setInterval(() => this.cleanOldCaptures(), 60 * 60 * 1000);
+    setInterval(() => this.cleanOldCaptures(), 30 * 60 * 1000);
   }
 
   cleanOldCaptures() {
@@ -48,8 +49,8 @@ export class CameraManager {
         const fullPath = path.join(CAPTURE_DIR, file);
         try {
           const stats = fs.statSync(fullPath);
-          // Hapus file rekaman sisa yang lebih dari 30 menit
-          if (now - stats.mtimeMs > 30 * 60 * 1000) {
+          // Hapus file rekaman sisa yang lebih dari 15 menit
+          if (now - stats.mtimeMs > 15 * 60 * 1000) {
             fs.unlinkSync(fullPath);
           }
         } catch (e) {}
@@ -104,7 +105,7 @@ export class CameraManager {
       stopTimer: null,
       lastFinishTime: 0,
       lastMotionTime: 0,
-      lastEventTime: Date.now()
+      lastPullActivity: Date.now()
     };
 
     this.sessions.set(cam.id, session);
@@ -124,6 +125,10 @@ export class CameraManager {
     if (session.watchdogTimer) {
       clearInterval(session.watchdogTimer);
       session.watchdogTimer = null;
+    }
+    if (session.pullLoopStop) {
+      session.pullLoopStop();
+      session.pullLoopStop = undefined;
     }
 
     try {
@@ -150,70 +155,157 @@ export class CameraManager {
 
       CameraRepo.updateStatus(cam.id, 'online');
       this.broadcast('camera:status', { id: cam.id, status: 'online' });
-      console.log(`[CameraManager] ✅ ${cam.name} online & listening events.`);
+      console.log(`[CameraManager] ✅ ${cam.name} online & starting controlled PullPoint loop...`);
 
-      client.on('event', (msg: any) => {
-        session.lastEventTime = Date.now();
-        try {
-          const topic = msg?.topic?._ || msg?.topic || '';
-          const rawSimple = msg?.message?.message?.data?.simpleItem;
-          const items = Array.isArray(rawSimple) ? rawSimple : (rawSimple ? [rawSimple] : []);
+      session.lastPullActivity = Date.now();
+      session.pullLoopStop = this.startControlledPullLoop(client, session);
 
-          let isPerson = topic.includes('peopleDetector');
-          let isMotion = topic.includes('CellMotionDetector') || topic.includes('TPSmartEvent');
-          let isActive = false;
-
-          for (const item of items) {
-            const name = item?.$?.Name;
-            const val = item?.$?.Value;
-            if (name === 'IsPeople') {
-              isPerson = true;
-              if (val === true || val === 'true') isActive = true;
-            } else if (name === 'IsMotion') {
-              isMotion = true;
-              if (val === true || val === 'true') isActive = true;
-            }
-          }
-
-          if (isPerson || isMotion) {
-            if (isActive) {
-              session.lastMotionTime = Date.now();
-              this.onPersonDetected(session);
-            } else {
-              this.onPersonLeft(session);
-            }
-          }
-        } catch (e) {
-          console.error('[CameraManager] Event parse error:', e);
-        }
-      });
-
-      // Self-healing Watchdog:
-      // Setiap 30 detik cek apakah ada event dalam 60 detik terakhir.
+      // Active Heartbeat Watchdog:
+      // Socket WiFi kamera IP Tapo bisa mati sepihak tanpa mengirim TCP FIN/RST.
+      // Jika tidak ada respon/aktivitas PullPoint > 90 detik, lakukan auto-recover instan.
       session.watchdogTimer = setInterval(() => {
-        const silenceDuration = Date.now() - session.lastEventTime;
-        if (silenceDuration > 60000) {
-          client.getEventProperties((err: any) => {
-            if (err) {
-              console.warn(`[CameraManager] ⚠️ Event bus dead for ${cam.name}. Reconnecting...`);
-              this.connectOnvif(session);
-            }
-          });
+        const silenceTime = Date.now() - session.lastPullActivity;
+        if (silenceTime > 90000) {
+          console.warn(`[CameraManager] 🚨 ${cam.name} socket inactive for ${Math.round(silenceTime / 1000)}s. Auto-recovering connection...`);
+          this.connectOnvif(session);
         }
-      }, 30000);
-
-      client.on('eventsError', (error: any) => {
-        console.warn(`[CameraManager] ⚠️ ${cam.name} ONVIF eventsError:`, error?.message || error);
-        if (!session.reconnectTimer) {
-          session.reconnectTimer = setTimeout(() => {
-            session.reconnectTimer = null;
-            this.connectOnvif(session);
-          }, 5000);
-        }
-      });
+      }, 15000);
     });
 
     session.camInstance = client;
+  }
+
+  /**
+   * Native Controlled PullPoint Loop
+   * Menggunakan renew() reguler dan hard timeout 25s per request pullMessages.
+   */
+  private startControlledPullLoop(client: any, session: ActiveSession): () => void {
+    let isRunning = true;
+    let termTime = 0;
+    const cam = session.camera;
+
+    const pullStep = () => {
+      if (!isRunning) return;
+
+      const now = Date.now();
+      // Inisialisasi subscription pertama kali
+      if (!client.events?.subscription) {
+        client.createPullPointSubscription((err: any) => {
+          if (!isRunning) return;
+          if (err) {
+            console.warn(`[CameraManager] ⚠️ ${cam.name} subscription error:`, err.message || err);
+            setTimeout(pullStep, 5000);
+            return;
+          }
+
+          termTime = client.events?.terminationTime
+            ? new Date(client.events.terminationTime).getTime()
+            : now + 120000;
+          session.lastPullActivity = Date.now();
+          doPull();
+        });
+      } else if (now > termTime - 40000) {
+        // Perpanjang masa aktif subscription yang ada (pakai renew, tidak buat endpoint/port baru)
+        client.renew({}, (err: any) => {
+          if (!isRunning) return;
+          if (err) {
+            console.warn(`[CameraManager] ⚠️ ${cam.name} renew failed, recreating sub:`, err.message || err);
+            delete client.events?.subscription;
+            setTimeout(pullStep, 2000);
+            return;
+          }
+          termTime = client.events?.terminationTime
+            ? new Date(client.events.terminationTime).getTime()
+            : now + 120000;
+          session.lastPullActivity = Date.now();
+          doPull();
+        });
+      } else {
+        doPull();
+      }
+    };
+
+    const doPull = () => {
+      if (!isRunning) return;
+
+      let pullHandled = false;
+      // Hard safety timer 75 detik per pull (karena default pull kamera jika sunyi adalah 60s).
+      // Jika kamera/socket WiFi nge-hang dan tidak panggil callback dalam 75s,
+      // kita putus dan re-pull agar tidak stuck selamanya.
+      const safetyTimer = setTimeout(() => {
+        if (pullHandled || !isRunning) return;
+        pullHandled = true;
+        console.warn(`[CameraManager] ⏱ Pull socket timeout on [${cam.name}], resetting subscription...`);
+        delete client.events?.subscription;
+        setTimeout(pullStep, 1000);
+      }, 75000);
+
+      client.pullMessages({ messageLimit: 10 }, (err: any, data: any) => {
+        if (pullHandled || !isRunning) return;
+        pullHandled = true;
+        clearTimeout(safetyTimer);
+        session.lastPullActivity = Date.now();
+
+        if (err) {
+          delete client.events?.subscription;
+          setTimeout(pullStep, 3000);
+          return;
+        }
+
+        if (data?.notificationMessage) {
+          const msgs = Array.isArray(data.notificationMessage)
+            ? data.notificationMessage
+            : [data.notificationMessage];
+
+          for (const msg of msgs) {
+            this.handleParsedMessage(session, msg);
+          }
+        }
+
+        setTimeout(pullStep, 500);
+      });
+    };
+
+    pullStep();
+
+    return () => {
+      isRunning = false;
+    };
+  }
+
+  private handleParsedMessage(session: ActiveSession, msg: any) {
+    try {
+      const topic = msg?.topic?._ || msg?.topic || '';
+      const rawSimple = msg?.message?.message?.data?.simpleItem;
+      const items = Array.isArray(rawSimple) ? rawSimple : (rawSimple ? [rawSimple] : []);
+
+      let isPerson = topic.includes('peopleDetector');
+      let isMotion = topic.includes('CellMotionDetector') || topic.includes('TPSmartEvent');
+      let isActive = false;
+
+      for (const item of items) {
+        const name = item?.$?.Name;
+        const val = item?.$?.Value;
+        if (name === 'IsPeople') {
+          isPerson = true;
+          if (val === true || val === 'true') isActive = true;
+        } else if (name === 'IsMotion') {
+          isMotion = true;
+          if (val === true || val === 'true') isActive = true;
+        }
+      }
+
+      if (isPerson || isMotion) {
+        if (isActive) {
+          session.lastMotionTime = Date.now();
+          this.onPersonDetected(session);
+        } else {
+          this.onPersonLeft(session);
+        }
+      }
+    } catch (e) {
+      console.error('[CameraManager] Parse error:', e);
+    }
   }
 
   private onPersonDetected(session: ActiveSession) {
@@ -251,12 +343,14 @@ export class CameraManager {
 
     const localStreamUrl = `rtsp://127.0.0.1:8554/${session.camera.id}`;
 
+    // Maksimal 90 detik per klip (~15-20MB pada 1080p 15fps)
+    // Menjamin ukuran video selalu aman di bawah batas 50MB Telegram Bot API
     const args = [
       '-y',
       '-rtsp_transport', 'tcp',
       '-use_wallclock_as_timestamps', '1',
       '-i', localStreamUrl,
-      '-t', '600', // Maksimal 10 menit jika aktivitas terus berlangsung
+      '-t', '90',
       '-c:v', 'copy',
       '-c:a', 'aac',
       '-movflags', '+faststart',
@@ -276,7 +370,7 @@ export class CameraManager {
       session.currentVideoPath = null;
     });
 
-    session.recordProc.on('close', async (code: number) => {
+    session.recordProc.on('close', (code: number) => {
       const duration = Math.round((Date.now() - session.recordingStartTime) / 1000);
       const videoFile = session.currentVideoPath;
       console.log(`[CameraManager] 🏁 Record finalized for [${session.camera.name}], duration: ${duration}s`);
@@ -291,16 +385,33 @@ export class CameraManager {
       }
       session.lastFinishTime = Date.now();
 
+      // Dispatch video upload ke Telegram secara async non-blocking
       if (duration >= 3 && videoFile && fs.existsSync(videoFile) && fs.statSync(videoFile).size > 20000) {
-        const topicId = await telegramService.ensureTopicForCamera(session.camera.id, session.camera.name);
-        await telegramService.sendVideo(
-          videoFile,
-          `📹 *Klip Rekaman: ${session.camera.name}*\n⏱ Durasi: \`${duration} detik\`\n🕒 Waktu: \`${timestampStr} WITA\``,
-          topicId
-        );
+        (async () => {
+          try {
+            const topicId = await telegramService.ensureTopicForCamera(session.camera.id, session.camera.name);
+            await telegramService.sendVideo(
+              videoFile,
+              `📹 *Klip Rekaman: ${session.camera.name}*\n⏱ Durasi: \`${duration} detik\`\n🕒 Waktu: \`${timestampStr} WITA\``,
+              topicId
+            );
+          } catch (e: any) {
+            console.error(`[CameraManager] Send video error:`, e.message);
+          } finally {
+            try {
+              if (fs.existsSync(videoFile)) fs.unlinkSync(videoFile);
+            } catch (e) {}
+          }
+        })();
       } else if (videoFile && fs.existsSync(videoFile)) {
-        // Hapus file sementara jika durasi terlalu pendek atau ukuran kosong/korup
         try { fs.unlinkSync(videoFile); } catch (e) {}
+      }
+
+      // Seamless Multi-Clip: Jika gerakan masih aktif, segera rekam klip berikutnya tanpa jeda!
+      const timeSinceLastMotion = Date.now() - session.lastMotionTime;
+      if (timeSinceLastMotion < 8000) {
+        console.log(`[CameraManager] 🔄 Motion still ongoing for [${session.camera.name}]. Starting next seamless clip...`);
+        this.onPersonDetected(session);
       }
     });
   }
@@ -314,11 +425,10 @@ export class CameraManager {
     }
 
     session.isStopping = true;
-    // Beri buffer sepi 20 detik setelah gerakan terakhir
+    // Beri buffer tenang 12 detik setelah gerakan terakhir
     session.stopTimer = setTimeout(() => {
-      // Verifikasi ulang: pastikan dalam 18 detik terakhir benar-benar tidak ada gerakan
       const quietDuration = Date.now() - session.lastMotionTime;
-      if (quietDuration < 18000) {
+      if (quietDuration < 10000) {
         session.isStopping = false;
         return;
       }
@@ -328,19 +438,19 @@ export class CameraManager {
         const proc = session.recordProc;
         proc.kill('SIGINT');
 
-        // Fallback force-kill jika FFmpeg tertahan pada RTSP socket
         setTimeout(() => {
           if (proc && !proc.killed) {
             try { proc.kill('SIGKILL'); } catch (e) {}
           }
         }, 5000);
       }
-    }, 20000);
+    }, 12000);
   }
 
   stopCamera(id: string) {
     const session = this.sessions.get(id);
     if (session) {
+      if (session.pullLoopStop) session.pullLoopStop();
       if (session.stopTimer) clearTimeout(session.stopTimer);
       if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
       if (session.watchdogTimer) clearInterval(session.watchdogTimer);

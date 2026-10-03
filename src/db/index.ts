@@ -1,7 +1,9 @@
+import path from 'path';
 import { Database } from 'bun:sqlite';
 import { Camera, CameraEvent } from '../core/types';
 
-const db = new Database('cctv.db', { create: true });
+const DB_PATH = path.join(import.meta.dir, '../../cctv.db');
+const db = new Database(DB_PATH, { create: true });
 
 // Schema Migrations
 db.run(`

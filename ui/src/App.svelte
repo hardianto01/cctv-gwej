@@ -224,6 +224,16 @@
       pc.addTransceiver('video', { direction: 'recvonly' });
       pc.addTransceiver('audio', { direction: 'recvonly' });
 
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+          setTimeout(() => {
+            if (cam.enabled && pcs.get(cam.id) === pc) {
+              startWebRTC(cam);
+            }
+          }, 3000);
+        }
+      };
+
       pc.ontrack = (event) => {
         const stream = event.streams[0];
         const videoEl = document.getElementById(`video-${cam.id}`) as HTMLVideoElement;

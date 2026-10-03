@@ -95,7 +95,7 @@ export const CameraRepo = {
         enabled = excluded.enabled,
         personDetection = excluded.personDetection,
         status = excluded.status,
-        telegramTopicId = excluded.telegramTopicId
+        telegramTopicId = COALESCE(excluded.telegramTopicId, cameras.telegramTopicId)
     `, [
       cam.id, cam.name, cam.ip, cam.port, cam.username, cam.password,
       cam.rtspUrl, cam.enabled ? 1 : 0, cam.personDetection ? 1 : 0, cam.status || 'offline',
@@ -123,5 +123,8 @@ export const EventRepo = {
   },
   getLatest(limit: number = 50): CameraEvent[] {
     return db.query('SELECT * FROM events ORDER BY timestamp DESC LIMIT ?').all(limit) as CameraEvent[];
+  },
+  getRecent(limit: number = 50): CameraEvent[] {
+    return this.getLatest(limit);
   }
 };

@@ -162,7 +162,7 @@ const app = new Elysia()
       // Events Feed
       .get('/events', ({ user, set }: any) => {
         if (!user) { set.status = 401; return { error: 'Unauthorized' }; }
-        return EventRepo.getRecent(50);
+        return EventRepo.getLatest(50);
       })
 
       // Settings Endpoints

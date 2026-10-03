@@ -16,6 +16,7 @@ if (!fs.existsSync(CAPTURE_DIR)) {
 interface ActiveSession {
   camera: Camera;
   camInstance: any;
+  isConnecting: boolean;
   isRecording: boolean;
   isStopping: boolean;
   recordProc: any;
@@ -24,6 +25,7 @@ interface ActiveSession {
   stopTimer: any;
   lastFinishTime: number;
   lastMotionTime: number;
+  watchdogTimer?: any;
   reconnectTimer?: any;
   lastEventTime: number;
 }
@@ -31,6 +33,29 @@ interface ActiveSession {
 export class CameraManager {
   private sessions = new Map<string, ActiveSession>();
   private wsClients = new Set<any>();
+
+  constructor() {
+    this.cleanOldCaptures();
+    setInterval(() => this.cleanOldCaptures(), 60 * 60 * 1000);
+  }
+
+  cleanOldCaptures() {
+    try {
+      if (!fs.existsSync(CAPTURE_DIR)) return;
+      const files = fs.readdirSync(CAPTURE_DIR);
+      const now = Date.now();
+      for (const file of files) {
+        const fullPath = path.join(CAPTURE_DIR, file);
+        try {
+          const stats = fs.statSync(fullPath);
+          // Hapus file rekaman sisa yang lebih dari 30 menit
+          if (now - stats.mtimeMs > 30 * 60 * 1000) {
+            fs.unlinkSync(fullPath);
+          }
+        } catch (e) {}
+      }
+    } catch (e) {}
+  }
 
   registerWsClient(ws: any) {
     this.wsClients.add(ws);
@@ -49,6 +74,11 @@ export class CameraManager {
     }
   }
 
+  getCamInstance(id: string): any | null {
+    const session = this.sessions.get(id);
+    return session?.camInstance || null;
+  }
+
   async startAll() {
     const cameras = CameraRepo.getAll().filter(c => c.enabled);
     console.log(`[CameraManager] Initializing ${cameras.length} active camera workers...`);
@@ -65,6 +95,7 @@ export class CameraManager {
     const session: ActiveSession = {
       camera: cam,
       camInstance: null,
+      isConnecting: false,
       isRecording: false,
       isStopping: false,
       recordProc: null,
@@ -82,9 +113,17 @@ export class CameraManager {
 
   private connectOnvif(session: ActiveSession) {
     const cam = session.camera;
+
+    if (session.isConnecting) return;
+    session.isConnecting = true;
+
     if (session.reconnectTimer) {
       clearTimeout(session.reconnectTimer);
       session.reconnectTimer = null;
+    }
+    if (session.watchdogTimer) {
+      clearInterval(session.watchdogTimer);
+      session.watchdogTimer = null;
     }
 
     try {
@@ -99,6 +138,8 @@ export class CameraManager {
       username: cam.username,
       password: cam.password
     }, (err: any) => {
+      session.isConnecting = false;
+
       if (err) {
         console.error(`[CameraManager] ${cam.name} (${cam.ip}) ONVIF connection error:`, err.message);
         CameraRepo.updateStatus(cam.id, 'offline');
@@ -111,19 +152,30 @@ export class CameraManager {
       this.broadcast('camera:status', { id: cam.id, status: 'online' });
       console.log(`[CameraManager] ✅ ${cam.name} online & listening events.`);
 
-      const handleEventMessage = (msg: any) => {
+      client.on('event', (msg: any) => {
         session.lastEventTime = Date.now();
         try {
           const topic = msg?.topic?._ || msg?.topic || '';
-          const data = msg?.message?.message?.data?.simpleItem;
-          const name = data?.$?.Name;
-          const val = data?.$?.Value;
+          const rawSimple = msg?.message?.message?.data?.simpleItem;
+          const items = Array.isArray(rawSimple) ? rawSimple : (rawSimple ? [rawSimple] : []);
 
-          const isPersonEvent = name === 'IsPeople' || topic.includes('peopleDetector');
-          const isMotionEvent = name === 'IsMotion' || topic.includes('CellMotionDetector') || topic.includes('TPSmartEvent');
+          let isPerson = topic.includes('peopleDetector');
+          let isMotion = topic.includes('CellMotionDetector') || topic.includes('TPSmartEvent');
+          let isActive = false;
 
-          if (isPersonEvent || isMotionEvent) {
-            const isActive = (val === true || val === 'true');
+          for (const item of items) {
+            const name = item?.$?.Name;
+            const val = item?.$?.Value;
+            if (name === 'IsPeople') {
+              isPerson = true;
+              if (val === true || val === 'true') isActive = true;
+            } else if (name === 'IsMotion') {
+              isMotion = true;
+              if (val === true || val === 'true') isActive = true;
+            }
+          }
+
+          if (isPerson || isMotion) {
             if (isActive) {
               session.lastMotionTime = Date.now();
               this.onPersonDetected(session);
@@ -134,36 +186,30 @@ export class CameraManager {
         } catch (e) {
           console.error('[CameraManager] Event parse error:', e);
         }
-      };
+      });
 
-      // Kustomisasi event loop yang stabil & anti-macet:
-      // Hindari loop bawaan node-onvif yang melakukan ratusan renew() per menit
-      client.removeAllListeners('event');
-      client.on('event', handleEventMessage);
-
-      // Heartbeat Watchdog per session:
-      // Jika dalam 90 detik sama sekali tidak ada event atau poll stuck, re-init koneksi secara hening
-      const scheduleWatchdog = () => {
-        if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
-        session.reconnectTimer = setInterval(() => {
-          const silenceDuration = Date.now() - session.lastEventTime;
-          // Cek apakah langganan event masih hidup dengan memanggil getEventProperties/pull
-          if (silenceDuration > 60000) {
-            client.getEventProperties((err: any) => {
-              if (err) {
-                console.warn(`[CameraManager] ⚠️ Event bus silent & ping failed for ${cam.name}. Reconnecting...`);
-                this.connectOnvif(session);
-              }
-            });
-          }
-        }, 30000);
-      };
-
-      scheduleWatchdog();
+      // Self-healing Watchdog:
+      // Setiap 30 detik cek apakah ada event dalam 60 detik terakhir.
+      session.watchdogTimer = setInterval(() => {
+        const silenceDuration = Date.now() - session.lastEventTime;
+        if (silenceDuration > 60000) {
+          client.getEventProperties((err: any) => {
+            if (err) {
+              console.warn(`[CameraManager] ⚠️ Event bus dead for ${cam.name}. Reconnecting...`);
+              this.connectOnvif(session);
+            }
+          });
+        }
+      }, 30000);
 
       client.on('eventsError', (error: any) => {
         console.warn(`[CameraManager] ⚠️ ${cam.name} ONVIF eventsError:`, error?.message || error);
-        setTimeout(() => this.connectOnvif(session), 4000);
+        if (!session.reconnectTimer) {
+          session.reconnectTimer = setTimeout(() => {
+            session.reconnectTimer = null;
+            this.connectOnvif(session);
+          }, 5000);
+        }
       });
     });
 
@@ -172,8 +218,9 @@ export class CameraManager {
 
   private onPersonDetected(session: ActiveSession) {
     const now = Date.now();
-    
+    session.lastMotionTime = now;
 
+    // Jika sedang merekam, batalkan rencana stop karena aktor masih aktif
     if (session.isRecording) {
       if (session.stopTimer) {
         clearTimeout(session.stopTimer);
@@ -200,11 +247,8 @@ export class CameraManager {
     EventRepo.add(eventRecord);
     this.broadcast('event:new', eventRecord);
 
-    console.log(`[CameraManager] 🚶‍♂️ Person detected on [${session.camera.name}] at ${timestampStr}`);
+    console.log(`[CameraManager] 🚶‍♂️ Continuous Recording started on [${session.camera.name}] at ${timestampStr}`);
 
-    // Stream via local go2rtc RTSP proxy (rtsp://127.0.0.1:8554/<camId>)
-    // Keuntungan: go2rtc sudah keep-alive koneksinya di RAM, sehingga FFmpeg langsung
-    // mengunci I-Frame (Keyframe) pertama secara instan (0 ms latency), MENGHILANGKAN TITIK BUTA AWAL!
     const localStreamUrl = `rtsp://127.0.0.1:8554/${session.camera.id}`;
 
     const args = [
@@ -212,7 +256,7 @@ export class CameraManager {
       '-rtsp_transport', 'tcp',
       '-use_wallclock_as_timestamps', '1',
       '-i', localStreamUrl,
-      '-t', '300',
+      '-t', '600', // Maksimal 10 menit jika aktivitas terus berlangsung
       '-c:v', 'copy',
       '-c:a', 'aac',
       '-movflags', '+faststart',
@@ -221,10 +265,21 @@ export class CameraManager {
 
     session.recordProc = spawn(FFMPEG_BIN, args);
 
+    session.recordProc.on('error', (err: any) => {
+      console.error(`[CameraManager] FFmpeg spawn error on [${session.camera.name}]:`, err.message);
+      session.isRecording = false;
+      session.isStopping = false;
+      session.recordProc = null;
+      if (session.currentVideoPath && fs.existsSync(session.currentVideoPath)) {
+        try { fs.unlinkSync(session.currentVideoPath); } catch (e) {}
+      }
+      session.currentVideoPath = null;
+    });
+
     session.recordProc.on('close', async (code: number) => {
       const duration = Math.round((Date.now() - session.recordingStartTime) / 1000);
       const videoFile = session.currentVideoPath;
-      console.log(`[CameraManager] 🏁 Record closed for [${session.camera.name}], duration: ${duration}s`);
+      console.log(`[CameraManager] 🏁 Record finalized for [${session.camera.name}], duration: ${duration}s`);
 
       session.isRecording = false;
       session.isStopping = false;
@@ -240,33 +295,61 @@ export class CameraManager {
         const topicId = await telegramService.ensureTopicForCamera(session.camera.id, session.camera.name);
         await telegramService.sendVideo(
           videoFile,
-          `📹 *Klip Deteksi: ${session.camera.name}*\n⏱ Durasi: \`${duration} detik\`\n🕒 Waktu: \`${timestampStr} WITA\``,
-        topicId
+          `📹 *Klip Rekaman: ${session.camera.name}*\n⏱ Durasi: \`${duration} detik\`\n🕒 Waktu: \`${timestampStr} WITA\``,
+          topicId
         );
+      } else if (videoFile && fs.existsSync(videoFile)) {
+        // Hapus file sementara jika durasi terlalu pendek atau ukuran kosong/korup
+        try { fs.unlinkSync(videoFile); } catch (e) {}
       }
     });
   }
 
   private onPersonLeft(session: ActiveSession) {
     if (!session.isRecording) return;
-    if (session.stopTimer) clearTimeout(session.stopTimer);
+
+    if (session.stopTimer) {
+      clearTimeout(session.stopTimer);
+      session.stopTimer = null;
+    }
 
     session.isStopping = true;
+    // Beri buffer sepi 20 detik setelah gerakan terakhir
     session.stopTimer = setTimeout(() => {
-      if (session.isRecording && session.recordProc) {
-        console.log(`[CameraManager] 🛑 Finalizing video for [${session.camera.name}]...`);
-        session.recordProc.kill('SIGINT');
+      // Verifikasi ulang: pastikan dalam 18 detik terakhir benar-benar tidak ada gerakan
+      const quietDuration = Date.now() - session.lastMotionTime;
+      if (quietDuration < 18000) {
+        session.isStopping = false;
+        return;
       }
-    }, 15000); // 15 detik buffer tenang
+
+      if (session.isRecording && session.recordProc) {
+        console.log(`[CameraManager] 🛑 Area tenang selama ${Math.round(quietDuration / 1000)}s. Finalizing video for [${session.camera.name}]...`);
+        const proc = session.recordProc;
+        proc.kill('SIGINT');
+
+        // Fallback force-kill jika FFmpeg tertahan pada RTSP socket
+        setTimeout(() => {
+          if (proc && !proc.killed) {
+            try { proc.kill('SIGKILL'); } catch (e) {}
+          }
+        }, 5000);
+      }
+    }, 20000);
   }
 
   stopCamera(id: string) {
     const session = this.sessions.get(id);
     if (session) {
+      if (session.stopTimer) clearTimeout(session.stopTimer);
+      if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
+      if (session.watchdogTimer) clearInterval(session.watchdogTimer);
       if (session.recordProc) {
         try { session.recordProc.kill('SIGKILL'); } catch (e) {}
       }
-      if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
+      if (session.currentVideoPath && fs.existsSync(session.currentVideoPath)) {
+        try { fs.unlinkSync(session.currentVideoPath); } catch (e) {}
+      }
       try { session.camInstance?.removeAllListeners?.(); } catch (e) {}
       this.sessions.delete(id);
     }
@@ -279,7 +362,6 @@ export class CameraManager {
         configContent += `  ${cam.id}:\n    - "${cam.rtspUrl}"\n`;
       }
       fs.writeFileSync(path.join(process.cwd(), 'go2rtc.yaml'), configContent);
-      // Reload go2rtc via curl API
       fetch('http://127.0.0.1:1984/api/restart', { method: 'POST' }).catch(() => {});
     } catch (e) {}
   }

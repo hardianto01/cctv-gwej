@@ -328,15 +328,33 @@
     else document.documentElement.classList.remove('dark');
 
     checkAuth();
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${proto}//${location.host}/ws`);
-    ws.onmessage = (msg) => {
-      try {
-        const data = JSON.parse(msg.data);
-        if (data.event === 'event:new') events = [data.payload, ...events.slice(0, 49)];
-        else if (data.event === 'camera:status') loadCameras();
-      } catch (e) {}
-    };
+
+    let ws: WebSocket | null = null;
+    let wsReconnectTimer: any = null;
+    let isDisposed = false;
+
+    function connectWs() {
+      if (isDisposed) return;
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${proto}//${location.host}/ws`);
+      ws.onmessage = (msg) => {
+        try {
+          const data = JSON.parse(msg.data);
+          if (data.event === 'event:new') events = [data.payload, ...events.slice(0, 49)];
+          else if (data.event === 'camera:status') loadCameras();
+        } catch (e) {}
+      };
+      ws.onclose = () => {
+        if (!isDisposed) {
+          wsReconnectTimer = setTimeout(connectWs, 3000);
+        }
+      };
+      ws.onerror = () => {
+        try { ws?.close(); } catch (e) {}
+      };
+    }
+
+    connectWs();
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -347,8 +365,10 @@
     window.addEventListener('keydown', handleKeyDown);
 
     return () => {
+      isDisposed = true;
+      if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
       window.removeEventListener('keydown', handleKeyDown);
-      ws.close();
+      ws?.close();
       pcs.forEach(pc => pc.close());
     };
   });

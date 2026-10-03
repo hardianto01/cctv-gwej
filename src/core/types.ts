@@ -9,6 +9,7 @@ export interface Camera {
   enabled: boolean;
   personDetection: boolean;
   status: 'online' | 'offline' | 'error';
+  telegramTopicId?: number;
   createdAt: string;
 }
 

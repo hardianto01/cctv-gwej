@@ -1,16 +1,24 @@
 import { Cam } from 'onvif';
 import { CameraRepo } from '../db';
+import { cameraManager } from './CameraManager';
 
 export class PTZService {
-  private ptzClients = new Map<string, any>();
+  private fallbackClients = new Map<string, any>();
 
-  private getClient(cameraId: string): Promise<any> {
-    if (this.ptzClients.has(cameraId)) {
-      return Promise.resolve(this.ptzClients.get(cameraId));
+  private async getClient(cameraId: string): Promise<any> {
+    // 1. Gunakan instance Cam aktif yang sudah terautentikasi di CameraManager
+    const activeInstance = cameraManager.getCamInstance(cameraId);
+    if (activeInstance) {
+      return activeInstance;
+    }
+
+    // 2. Fallback jika camera manager belum aktif untuk kamera ini
+    if (this.fallbackClients.has(cameraId)) {
+      return this.fallbackClients.get(cameraId);
     }
 
     const cam = CameraRepo.getById(cameraId);
-    if (!cam) return Promise.reject(new Error('Kamera tidak ditemukan'));
+    if (!cam) throw new Error('Kamera tidak ditemukan');
 
     return new Promise((resolve, reject) => {
       const client = new Cam({
@@ -20,7 +28,7 @@ export class PTZService {
         password: cam.password
       }, (err: any) => {
         if (err) return reject(err);
-        this.ptzClients.set(cameraId, client);
+        this.fallbackClients.set(cameraId, client);
         resolve(client);
       });
     });
@@ -48,7 +56,8 @@ export class PTZService {
         // relativeMove adalah standar resmi ONVIF untuk geser per-derajat tanpa mutar liar
         client.relativeMove({ x, y }, (err: any) => {
           if (err) {
-            console.error('PTZ RelativeMove error:', err.message);
+            console.error('[PTZService] RelativeMove error:', err.message);
+            this.fallbackClients.delete(cameraId);
             return reject(err);
           }
           resolve({ success: true, direction, mode: 'relative' });
